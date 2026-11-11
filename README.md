@@ -4,7 +4,7 @@ IQS9151搭載のyuPad43（10 RX × 9 TX）向けZMKモジュールです。
 
 [接続・導入ガイド](https://github.com/yuchamichami/yuPad43/blob/main/README.md#zmk) · [XIAO用設定例](https://github.com/yuchamichami/yuPad43/tree/main/firmware/xiao-example)
 
-基準はZMK v0.3.0、2026-10-30のATI通信修正版です。校正品質・BLE・異常時の復旧は未検証または調整が残っています。旧13 × 12版、2枚重ね版、CoreX用パッドには適用できません。
+対応基準はZMK v0.3.0です。校正品質・BLE・異常時の復旧は未検証または調整が残っています。yuPad43専用の電極設定を含みます。
 
 ## ライセンス
 
