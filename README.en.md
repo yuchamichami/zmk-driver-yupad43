@@ -4,7 +4,7 @@
 
 A ZMK module for the IQS9151-based yuPad43 touchpad (10 RX × 9 TX), targeting ZMK v0.3.0.
 
-[Connection guide](https://github.com/yuchamichami/yuPad43/blob/main/README.en.md) · [ZMK setup](https://github.com/yuchamichami/yuPad43/blob/main/docs/zmk.md) (Japanese) · [XIAO configuration example](https://github.com/yuchamichami/yuPad43/tree/main/firmware/xiao-example)
+[Connection guide](https://github.com/yuchamichami/yuPad43/blob/main/README.en.md) · [ZMK setup](https://github.com/yuchamichami/yuPad43/blob/main/docs/zmk.en.md) · [XIAO configuration example](https://github.com/yuchamichami/yuPad43/tree/main/firmware/xiao-example)
 
 ## Operation
 
