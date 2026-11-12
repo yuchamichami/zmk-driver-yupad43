@@ -56,6 +56,7 @@
 #define IQS9151_ADDR_TOUCH_THRESHOLD_ADJUST    0x12F6
 
 /* Info Flags bits */
+#define IQS9151_INFO_ATI_ERROR                 BIT(3)
 #define IQS9151_INFO_SHOW_RESET                BIT(7)
 #define IQS9151_INFO_GLOBAL_TP_TOUCH           BIT(9)
 #define IQS9151_INFO_TP_TOUCH_TOGGLED          BIT(13)

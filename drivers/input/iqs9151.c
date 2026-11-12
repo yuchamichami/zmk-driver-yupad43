@@ -214,6 +214,7 @@ struct iqs9151_data {
     bool three_finger_one_lead_valid;
     bool three_finger_two_lead_valid;
     struct iqs9151_frame prev_frame;
+    bool ati_warning;
     bool three_active;
     bool three_hold_sent;
     bool three_swipe_sent;
@@ -2191,6 +2192,19 @@ static void iqs9151_process_frame(struct iqs9151_data *data,
     bool released_from_hold;
     bool suppress_cursor_tail;
 
+    /* Calibration quality is advisory for end users. Keep processing valid
+     * input even when ATI error is set; factory inspection rejects that flag.
+     * Transport errors and incomplete ATI are handled separately. */
+    const bool ati_warning = (frame->info_flags & IQS9151_INFO_ATI_ERROR) != 0U;
+    if (ati_warning != data->ati_warning) {
+        if (ati_warning) {
+            LOG_WRN("ATI quality warning; continuing touch input");
+        } else {
+            LOG_INF("ATI quality warning cleared");
+        }
+        data->ati_warning = ati_warning;
+    }
+
     iqs9151_two_finger_result_reset(&two_result);
 
     if (iqs9151_handle_show_reset(data, frame)) {
@@ -2614,6 +2628,8 @@ static int iqs9151_init(const struct device *dev) {
         LOG_ERR("ATI failed (%d)", ret);
         return ret;
     }
+    /* Completion is distinct from quality. ATI error in subsequent frames
+     * never disables user input. Do not retry calibration in a warning loop. */
     LOG_DBG("ATI complete");
 
     // Setup IRQ Call Back

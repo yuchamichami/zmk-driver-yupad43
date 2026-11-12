@@ -193,7 +193,7 @@
 #define XY_DYNAMIC_FILTER_BOTTOM_BETA            0x0A
 #define XY_DYNAMIC_FILTER_STATIC_FILTER_BETA     0x14
 #define STATIONARY_TOUCH_MOV_THRESHOLD           0x05 // 0x14
-#define FINGER_SPLIT_FACTOR                      0x03
+#define FINGER_SPLIT_FACTOR                      0x00
 #define X_TRIM_VALUE                             0x14
 #define Y_TRIM_VALUE                             0x14
 #define JITTER_FILTER_DELTA                      0x02 //0x02
