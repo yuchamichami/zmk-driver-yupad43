@@ -9,6 +9,7 @@
 #include <zephyr/input/input.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
 
@@ -23,6 +24,51 @@
 LOG_MODULE_REGISTER(iqs9151, CONFIG_INPUT_IQS9151_LOG_LEVEL);
 
 #define DT_DRV_COMPAT azoteq_iqs9151
+
+/*
+ * Run all driver work items on a dedicated cooperative work queue higher
+ * priority than k_sys_work_q (-1). On a ZMK split central, k_sys_work_q is
+ * shared with BLE split traffic, USB HID, ZMK Studio, and NVS writes, which
+ * can delay RDY reads or stall keyboard processing during pad recovery.
+ */
+#ifndef CONFIG_INPUT_IQS9151_TEST
+#define IQS9151_WQ_STACK_SIZE 2048
+#define IQS9151_WQ_PRIORITY   K_PRIO_COOP(2)
+K_THREAD_STACK_DEFINE(iqs9151_wq_stack, IQS9151_WQ_STACK_SIZE);
+static struct k_work_q iqs9151_wq;
+static atomic_t iqs9151_wq_started;
+
+static inline int iqs9151_work_submit(struct k_work *work) {
+    return k_work_submit_to_queue(&iqs9151_wq, work);
+}
+static inline int iqs9151_work_schedule(struct k_work_delayable *dwork, k_timeout_t delay) {
+    return k_work_schedule_for_queue(&iqs9151_wq, dwork, delay);
+}
+static inline int iqs9151_work_reschedule(struct k_work_delayable *dwork, k_timeout_t delay) {
+    return k_work_reschedule_for_queue(&iqs9151_wq, dwork, delay);
+}
+#else
+static inline int iqs9151_work_submit(struct k_work *work) {
+    return k_work_submit(work);
+}
+static inline int iqs9151_work_schedule(struct k_work_delayable *dwork, k_timeout_t delay) {
+    return k_work_schedule(dwork, delay);
+}
+static inline int iqs9151_work_reschedule(struct k_work_delayable *dwork, k_timeout_t delay) {
+    return k_work_reschedule(dwork, delay);
+}
+#endif
+
+#define IQS9151_KEY_REPORT_TIMEOUT     K_MSEC(20)
+#define IQS9151_RDY_POST_STOP_US       60U
+#define IQS9151_RDY_RECHECK_DELAY_MS   12
+#define IQS9151_FAST_RECOVERIES_MAX    3U
+#define IQS9151_TOTAL_RECOVERIES_MAX   12U
+#define IQS9151_RECOVERY_WINDOW_MS     5000LL
+#define IQS9151_FAST_RETRY_DELAY_MS    200
+#define IQS9151_SLOW_RETRY_DELAY_MS    2000
+#define IQS9151_CONSEC_READ_ERR_LIMIT  3U
+#define IQS9151_BOOT_ID_RETRIES        4
 
 #define IQS9151_I2C_CHUNK_SIZE 30
 #define IQS9151_RSTD_DELAY_MS 100
@@ -85,6 +131,7 @@ LOG_MODULE_REGISTER(iqs9151, CONFIG_INPUT_IQS9151_LOG_LEVEL);
 struct iqs9151_config {
     struct i2c_dt_spec i2c;
     struct gpio_dt_spec irq_gpio;
+    struct gpio_dt_spec reset_gpio;
 };
 struct iqs9151_frame {
     int16_t rel_x;
@@ -187,7 +234,14 @@ struct iqs9151_motion_history {
 struct iqs9151_data {
     const struct device *dev;
     struct gpio_callback gpio_cb;
+    atomic_t frames_enabled;
+    bool recover_hard_reset;
+    uint8_t recovery_attempts;
+    uint8_t consecutive_read_errors;
+    int64_t last_recovery_ms;
     struct k_work work;
+    struct k_work_delayable recover_work;
+    struct k_work_delayable rdy_recheck_work;
     struct k_work_delayable one_finger_click_work;
     struct k_work_delayable two_finger_click_work;
     struct k_work_delayable three_finger_click_work;
@@ -536,32 +590,44 @@ static int iqs9151_read_u16(const struct iqs9151_config *cfg, uint16_t reg, uint
     return 0;
 }
 
-static int iqs9151_update_bits_u16(const struct iqs9151_config *cfg, uint16_t reg,
-                                   uint16_t mask, uint16_t value) {
-    uint16_t current;
-    int ret = iqs9151_read_u16(cfg, reg, &current);
+static void iqs9151_wait_for_ready(const struct device *dev, uint16_t timeout_ms) {
+    const struct iqs9151_config *cfg = dev->config;
+    uint16_t elapsed = 0;
+    int state;
 
+    /* Allow RDY from a just-closed I2C STOP window to de-assert high first. */
+    k_busy_wait(IQS9151_RDY_POST_STOP_US);
+
+    while ((state = gpio_pin_get_dt(&cfg->irq_gpio)) == 0 && elapsed < timeout_ms) {
+        k_sleep(K_MSEC(1));
+        elapsed++;
+    }
+
+    if (state < 0) {
+        LOG_ERR("RDY GPIO read failed (%d)", state);
+        return;
+    }
+    if (elapsed >= timeout_ms && state == 0) {
+        LOG_WRN("RDY timeout after %dms", timeout_ms);
+    }
+    LOG_DBG("IRQGPIO=%d,TIME=%dms", state, elapsed);
+}
+
+static int iqs9151_update_bits_u16(const struct device *dev, uint16_t reg,
+                                   uint16_t mask, uint16_t value) {
+    const struct iqs9151_config *cfg = dev->config;
+    uint16_t current;
+    int ret;
+
+    iqs9151_wait_for_ready(dev, 200);
+    ret = iqs9151_read_u16(cfg, reg, &current);
     if (ret != 0) {
         return ret;
     }
 
     current = (uint16_t)((current & ~mask) | (value & mask));
+    iqs9151_wait_for_ready(dev, 200);
     return iqs9151_write_u16(cfg, reg, current);
-}
-
-static void iqs9151_wait_for_ready(const struct device *dev, uint16_t timeout_ms) {
-    const struct iqs9151_config *cfg = dev->config;
-    uint16_t elapsed = 0;
-
-    while (!gpio_pin_get_dt(&cfg->irq_gpio) && elapsed < timeout_ms) {
-        k_sleep(K_MSEC(1));
-        elapsed++;
-    }
-
-    if (elapsed >= timeout_ms) {
-        LOG_WRN("RDY timeout after %dms", timeout_ms);
-    }
-    LOG_DBG("IRQGPIO=%d,TIME=%dms", gpio_pin_get_dt(&cfg->irq_gpio), elapsed);
 }
 
 static int iqs9151_write_chunks(const struct device *dev, const struct iqs9151_config *cfg
@@ -906,8 +972,8 @@ static bool iqs9151_emit_click(struct iqs9151_data *data,
         return false;
     }
 
-    iqs9151_report_key_event(dev, button, true, true, K_FOREVER);
-    iqs9151_report_key_event(dev, button, false, true, K_FOREVER);
+    iqs9151_report_key_event(dev, button, true, true, IQS9151_KEY_REPORT_TIMEOUT);
+    iqs9151_report_key_event(dev, button, false, true, IQS9151_KEY_REPORT_TIMEOUT);
     return true;
 }
 
@@ -918,7 +984,7 @@ static bool iqs9151_emit_hold_press(struct iqs9151_data *data,
         return false;
     }
 
-    iqs9151_report_key_event(dev, button, true, true, K_FOREVER);
+    iqs9151_report_key_event(dev, button, true, true, IQS9151_KEY_REPORT_TIMEOUT);
     data->hold_button = button;
     return true;
 }
@@ -1123,8 +1189,8 @@ static bool iqs9151_one_finger_update(struct iqs9151_data *data,
         IS_ENABLED(CONFIG_INPUT_IQS9151_1F_PRESSHOLD_ENABLE)) {
         data->one_finger_click_pending = true;
         data->one_finger_click_pending_ms = now_ms;
-        k_work_reschedule(&data->one_finger_click_work,
-                          K_MSEC(ONE_FINGER_CLICK_HOLD_MAX_MS));
+        (void)iqs9151_work_reschedule(&data->one_finger_click_work,
+                                      K_MSEC(ONE_FINGER_CLICK_HOLD_MAX_MS));
     } else if (frame->finger_count != 0U) {
         iqs9151_clear_one_finger_click_pending(data);
         (void)k_work_cancel_delayable(&data->one_finger_click_work);
@@ -1356,8 +1422,8 @@ static void iqs9151_two_finger_update(struct iqs9151_data *data,
             IS_ENABLED(CONFIG_INPUT_IQS9151_2F_PRESSHOLD_ENABLE)) {
             data->two_finger_click_pending = true;
             data->two_finger_click_pending_ms = now_ms;
-            k_work_reschedule(&data->two_finger_click_work,
-                              K_MSEC(TWO_FINGER_CLICK_HOLD_MAX_MS));
+            (void)iqs9151_work_reschedule(&data->two_finger_click_work,
+                                          K_MSEC(TWO_FINGER_CLICK_HOLD_MAX_MS));
         }
 
         iqs9151_two_finger_reset(state);
@@ -1402,8 +1468,8 @@ static void iqs9151_two_finger_update(struct iqs9151_data *data,
         IS_ENABLED(CONFIG_INPUT_IQS9151_2F_PRESSHOLD_ENABLE)) {
         data->two_finger_click_pending = true;
         data->two_finger_click_pending_ms = now_ms;
-        k_work_reschedule(&data->two_finger_click_work,
-                          K_MSEC(TWO_FINGER_CLICK_HOLD_MAX_MS));
+        (void)iqs9151_work_reschedule(&data->two_finger_click_work,
+                                      K_MSEC(TWO_FINGER_CLICK_HOLD_MAX_MS));
     }
 
     iqs9151_two_finger_reset(state);
@@ -1529,15 +1595,15 @@ static bool iqs9151_three_finger_update(struct iqs9151_data *data,
             if (iqs9151_abs32(data->three_dx) >= CONFIG_INPUT_IQS9151_3F_SWIPE_THRESHOLD &&
                 iqs9151_abs32(data->three_dx) >= iqs9151_abs32(data->three_dy)) {
                 const uint16_t key = (data->three_dx < 0) ? INPUT_BTN_4 : INPUT_BTN_3;
-                iqs9151_report_key_event(dev, key, true, true, K_FOREVER);
-                iqs9151_report_key_event(dev, key, false, true, K_FOREVER);
+                iqs9151_report_key_event(dev, key, true, true, IQS9151_KEY_REPORT_TIMEOUT);
+                iqs9151_report_key_event(dev, key, false, true, IQS9151_KEY_REPORT_TIMEOUT);
                 data->three_swipe_sent = true;
                 return true;
             } else if (iqs9151_abs32(data->three_dy) >= CONFIG_INPUT_IQS9151_3F_SWIPE_THRESHOLD &&
                        iqs9151_abs32(data->three_dy) > iqs9151_abs32(data->three_dx)) {
                 const uint16_t key = (data->three_dy < 0) ? INPUT_BTN_5 : INPUT_BTN_6;
-                iqs9151_report_key_event(dev, key, true, true, K_FOREVER);
-                iqs9151_report_key_event(dev, key, false, true, K_FOREVER);
+                iqs9151_report_key_event(dev, key, true, true, IQS9151_KEY_REPORT_TIMEOUT);
+                iqs9151_report_key_event(dev, key, false, true, IQS9151_KEY_REPORT_TIMEOUT);
                 data->three_swipe_sent = true;
                 return true;
             }
@@ -1605,8 +1671,8 @@ static bool iqs9151_three_finger_update(struct iqs9151_data *data,
             IS_ENABLED(CONFIG_INPUT_IQS9151_3F_PRESSHOLD_ENABLE)) {
             data->three_finger_click_pending = true;
             data->three_finger_click_pending_ms = now_ms;
-            k_work_reschedule(&data->three_finger_click_work,
-                              K_MSEC(THREE_FINGER_CLICK_HOLD_MAX_MS));
+            (void)iqs9151_work_reschedule(&data->three_finger_click_work,
+                                          K_MSEC(THREE_FINGER_CLICK_HOLD_MAX_MS));
         }
 
         iqs9151_three_finger_reset(data);
@@ -1649,8 +1715,8 @@ static bool iqs9151_three_finger_update(struct iqs9151_data *data,
         IS_ENABLED(CONFIG_INPUT_IQS9151_3F_PRESSHOLD_ENABLE)) {
         data->three_finger_click_pending = true;
         data->three_finger_click_pending_ms = now_ms;
-        k_work_reschedule(&data->three_finger_click_work,
-                          K_MSEC(THREE_FINGER_CLICK_HOLD_MAX_MS));
+        (void)iqs9151_work_reschedule(&data->three_finger_click_work,
+                                      K_MSEC(THREE_FINGER_CLICK_HOLD_MAX_MS));
     }
 
     iqs9151_three_finger_reset(data);
@@ -1661,7 +1727,7 @@ static void iqs9151_reset_gesture_states(struct iqs9151_data *data,
                                          const struct device *dev,
                                          bool release_hold) {
     if (data->two_finger.active && data->two_finger.mode == IQS9151_2F_MODE_PINCH) {
-        iqs9151_report_key_event(dev, INPUT_BTN_7, false, true, K_FOREVER);
+        iqs9151_report_key_event(dev, INPUT_BTN_7, false, true, K_NO_WAIT);
     }
     if (release_hold) {
         iqs9151_release_hold(data, dev);
@@ -1705,7 +1771,7 @@ static void iqs9151_inertia_start(struct iqs9151_inertia_state *state,
     state->elapsed_ms = 0U;
     state->last_ms = k_uptime_get();
     state->active = true;
-    k_work_schedule(work, K_MSEC(params->interval_ms));
+    (void)iqs9151_work_schedule(work, K_MSEC(params->interval_ms));
 }
 
 static bool iqs9151_inertia_step(struct iqs9151_inertia_state *state,
@@ -1789,8 +1855,8 @@ static void iqs9151_inertia_scroll_work_cb(struct k_work *work) {
     }
 
     if (active) {
-        k_work_schedule(&data->inertia_scroll_work,
-                        K_MSEC(iqs9151_scroll_params.interval_ms));
+        (void)iqs9151_work_schedule(&data->inertia_scroll_work,
+                                    K_MSEC(iqs9151_scroll_params.interval_ms));
     }
 }
 
@@ -1846,8 +1912,8 @@ static void iqs9151_inertia_cursor_work_cb(struct k_work *work) {
     }
 
     if (active) {
-        k_work_schedule(&data->inertia_cursor_work,
-                        K_MSEC(iqs9151_cursor_params.interval_ms));
+        (void)iqs9151_work_schedule(&data->inertia_cursor_work,
+                                    K_MSEC(iqs9151_cursor_params.interval_ms));
     }
 }
 
@@ -2155,10 +2221,10 @@ static void iqs9151_report_frame_events(const struct device *dev,
                                         bool cursor_moving,
                                         bool suppress_cursor_tail) {
     if (two_result->pinch_started) {
-        iqs9151_report_key_event(dev, INPUT_BTN_7, true, true, K_FOREVER);
+        iqs9151_report_key_event(dev, INPUT_BTN_7, true, true, IQS9151_KEY_REPORT_TIMEOUT);
     }
     if (two_result->pinch_ended) {
-        iqs9151_report_key_event(dev, INPUT_BTN_7, false, true, K_FOREVER);
+        iqs9151_report_key_event(dev, INPUT_BTN_7, false, true, IQS9151_KEY_REPORT_TIMEOUT);
     }
 
     if (two_result->pinch_active) {
@@ -2249,6 +2315,20 @@ static void iqs9151_process_frame(struct iqs9151_data *data,
     iqs9151_push_finger_history(data, frame->finger_count, now_ms);
 }
 
+static void iqs9151_schedule_recovery(struct iqs9151_data *data, int64_t now_ms,
+                                      bool hard_reset);
+static int iqs9151_set_interrupt(const struct device *dev, const bool en);
+
+static void iqs9151_rdy_recheck_work_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs9151_data *data = CONTAINER_OF(dwork, struct iqs9151_data, rdy_recheck_work);
+    const struct iqs9151_config *cfg = data->dev->config;
+
+    if (atomic_get(&data->frames_enabled) && gpio_pin_get_dt(&cfg->irq_gpio) > 0) {
+        (void)iqs9151_work_submit(&data->work);
+    }
+}
+
 static void iqs9151_work_cb(struct k_work *work) {
     struct iqs9151_data *data = CONTAINER_OF(work, struct iqs9151_data, work);
     const struct device *dev = data->dev;
@@ -2257,25 +2337,75 @@ static void iqs9151_work_cb(struct k_work *work) {
     int ret;
     const int64_t now_ms = k_uptime_get();
 
-    ret = iqs9151_read_frame(cfg, &frame);
-    if (ret != 0) {
-        LOG_ERR("frame read failed (%d)", ret);
+    /* Ignore stale queued edges while reconfiguring or after the window closed. */
+    if (!atomic_get(&data->frames_enabled)) {
+        return;
+    }
+    ret = gpio_pin_get_dt(&cfg->irq_gpio);
+    if (ret < 0) {
+        LOG_ERR("irq_gpio read failed (%d)", ret);
+        return;
+    }
+    if (ret == 0) {
         return;
     }
 
+    ret = iqs9151_read_frame(cfg, &frame);
+    if (ret != 0) {
+        LOG_ERR("frame read failed (%d)", ret);
+        (void)i2c_recover_bus(cfg->i2c.bus);
+        if (++data->consecutive_read_errors >= IQS9151_CONSEC_READ_ERR_LIMIT) {
+            atomic_clear(&data->frames_enabled);
+            (void)k_work_cancel_delayable(&data->rdy_recheck_work);
+            (void)iqs9151_set_interrupt(dev, false);
+            iqs9151_reset_gesture_states(data, dev, true);
+            iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
+            iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
+            iqs9151_schedule_recovery(data, now_ms, true);
+        }
+        return;
+    }
+
+    data->consecutive_read_errors = 0U;
+
+    if ((frame.info_flags & IQS9151_INFO_SHOW_RESET) != 0U) {
+        atomic_clear(&data->frames_enabled);
+        (void)k_work_cancel_delayable(&data->rdy_recheck_work);
+        (void)iqs9151_set_interrupt(dev, false);
+        iqs9151_process_frame(data, &frame, now_ms);
+        iqs9151_schedule_recovery(data, now_ms, false);
+        return;
+    }
+
+    data->recovery_attempts = 0U;
     iqs9151_process_frame(data, &frame, now_ms);
+
+    /*
+     * One-shot level watchdog after an active frame: if RDY stayed active-low
+     * or re-asserted without crossing V_IH (missing a falling edge), pick up
+     * the next window cleanly; otherwise this fires once in 12 ms and stops.
+     */
+    if (atomic_get(&data->frames_enabled)) {
+        (void)iqs9151_work_reschedule(&data->rdy_recheck_work,
+                                      K_MSEC(IQS9151_RDY_RECHECK_DELAY_MS));
+    }
 }
 
 static void iqs9151_gpio_cb(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
+    ARG_UNUSED(port);
+    ARG_UNUSED(pins);
     struct iqs9151_data *data = CONTAINER_OF(cb, struct iqs9151_data, gpio_cb);
-    k_work_submit(&data->work);
+    if (atomic_get(&data->frames_enabled)) {
+        (void)iqs9151_work_submit(&data->work);
+    }
 }
 
 static int iqs9151_set_interrupt(const struct device *dev, const bool en) {
     const struct iqs9151_config *config = dev->config;
-    int ret = gpio_pin_interrupt_configure_dt( &config->irq_gpio, en ? GPIO_INT_EDGE_TO_ACTIVE : GPIO_INT_DISABLE);
+    int ret = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+                                              en ? GPIO_INT_EDGE_TO_ACTIVE : GPIO_INT_DISABLE);
     if (ret < 0) {
-        LOG_ERR("can't set interrupt");
+        LOG_ERR("can't set interrupt (%d)", ret);
     }
     return ret;
 }
@@ -2484,7 +2614,7 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
                       IQS9151_TRACKPAD_SETTING_FLIP_X;
     }
 
-    ret = iqs9151_update_bits_u16(cfg, IQS9151_ADDR_TRACKPAD_SETTINGS,
+    ret = iqs9151_update_bits_u16(dev, IQS9151_ADDR_TRACKPAD_SETTINGS,
                                   IQS9151_TRACKPAD_SETTING_FLIP_X |
                                       IQS9151_TRACKPAD_SETTING_FLIP_Y |
                                       IQS9151_TRACKPAD_SETTING_SWITCH_XY,
@@ -2494,6 +2624,7 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
         return ret;
     }
 
+    iqs9151_wait_for_ready(dev, 200);
     ret = iqs9151_write_u16(cfg, IQS9151_ADDR_X_RESOLUTION,
                             (uint16_t)CONFIG_INPUT_IQS9151_RESOLUTION_X);
     if (ret != 0) {
@@ -2501,6 +2632,7 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
         return ret;
     }
 
+    iqs9151_wait_for_ready(dev, 200);
     ret = iqs9151_write_u16(cfg, IQS9151_ADDR_Y_RESOLUTION,
                             (uint16_t)CONFIG_INPUT_IQS9151_RESOLUTION_Y);
     if (ret != 0) {
@@ -2508,6 +2640,7 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
         return ret;
     }
 
+    iqs9151_wait_for_ready(dev, 200);
     ret = iqs9151_write_u16(cfg, IQS9151_ADDR_TRACKPAD_ATI_TARGET,
                             (uint16_t)CONFIG_INPUT_IQS9151_ATI_TARGETCOUNT);
     if (ret != 0) {
@@ -2515,6 +2648,7 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
         return ret;
     }
 
+    iqs9151_wait_for_ready(dev, 200);
     ret = iqs9151_write_u16(cfg, IQS9151_ADDR_XY_DYNAMIC_FILTER_BOTTOM_SPEED,
                             (uint16_t)CONFIG_INPUT_IQS9151_DYNAMIC_FILTER_BOTTOM_SPEED);
     if (ret != 0) {
@@ -2522,6 +2656,7 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
         return ret;
     }
 
+    iqs9151_wait_for_ready(dev, 200);
     ret = iqs9151_write_u16(cfg, IQS9151_ADDR_XY_DYNAMIC_FILTER_TOP_SPEED,
                             (uint16_t)CONFIG_INPUT_IQS9151_DYNAMIC_FILTER_TOP_SPEED);
     if (ret != 0) {
@@ -2529,6 +2664,7 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
         return ret;
     }
 
+    iqs9151_wait_for_ready(dev, 200);
     ret = iqs9151_i2c_write(
         cfg, IQS9151_ADDR_XY_DYNAMIC_FILTER_BOTTOM_BETA,
         (const uint8_t[]){(uint8_t)CONFIG_INPUT_IQS9151_DYNAMIC_FILTER_BOTTOM_BETA}, 1);
@@ -2540,71 +2676,38 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
     return 0;
 }
 
-static int iqs9151_init(const struct device *dev) {
+static void iqs9151_pulse_hw_reset_and_recover_bus(const struct device *dev) {
     const struct iqs9151_config *cfg = dev->config;
-    struct iqs9151_data *data = dev->data;
+
+    if (cfg->reset_gpio.port != NULL && device_is_ready(cfg->reset_gpio.port)) {
+        /* Assert active-low MCLR for 5 ms, then release to pull-up. */
+        (void)gpio_pin_set_dt(&cfg->reset_gpio, 1);
+        k_msleep(5);
+        (void)gpio_pin_set_dt(&cfg->reset_gpio, 0);
+        k_msleep(20);
+    }
+    (void)i2c_recover_bus(cfg->i2c.bus);
+}
+
+static int iqs9151_configure_after_reset(const struct device *dev) {
+    const struct iqs9151_config *cfg = dev->config;
     int ret;
-    data->dev = dev;
-
-    LOG_DBG("Initialization Start");
-
-    if (!device_is_ready(cfg->i2c.bus)) {
-        LOG_ERR("I2C bus not ready");
-        return -ENODEV;
-    }
-
-    if (!cfg->irq_gpio.port) {
-        LOG_ERR("IRQ GPIO not defined");
-        return -ENODEV;
-    }
-    if (!device_is_ready(cfg->irq_gpio.port)) {
-        LOG_ERR("IRQ GPIO not ready");
-        return -ENODEV;
-    }
-    ret = gpio_pin_configure_dt(&cfg->irq_gpio, GPIO_INPUT);
-    if (ret) {
-        return ret;
-    }
-
-    iqs9151_wait_for_ready(dev, 500);
-    
-    // Check Product Number
-    ret = iqs9151_check_product_number(dev);
-    if (ret != 0) {
-        return ret;
-    }
 
     iqs9151_wait_for_ready(dev, 500);
 
-    // SW Reset (Show Reset wait + ACK)
-    ret = iqs9151_sw_reset(dev);
-    if (ret) {
-        LOG_ERR("SW Reset failed (%d)", ret);
-        return ret;
-    }
-    LOG_DBG("SW Reset complete");
-
-    iqs9151_wait_for_ready(dev, 500);
-
-    // ACK Reset
     ret = iqs9151_ack_reset(dev);
-    if (ret) {
+    if (ret != 0) {
         LOG_ERR("Reset flag clear failed (%d)", ret);
         return ret;
     }
     LOG_DBG("ACK Reset complete");
 
-    iqs9151_wait_for_ready(dev, 500);
-
-    // Setup Initial Config
     ret = iqs9151_configure(dev);
     if (ret != 0) {
         LOG_ERR("Device configuration failed: %d", ret);
         return ret;
     }
     LOG_DBG("Setup Initial Config complete");
-
-    iqs9151_wait_for_ready(dev, 100);
 
     ret = iqs9151_apply_kconfig_overrides(dev);
     if (ret != 0) {
@@ -2613,11 +2716,10 @@ static int iqs9151_init(const struct device *dev) {
     }
     LOG_DBG("Kconfig overrides applied");
 
-    iqs9151_wait_for_ready(dev, 100);
+    iqs9151_wait_for_ready(dev, 200);
 
-    // ATI
     ret = iqs9151_run_ati(cfg);
-    if (ret) {
+    if (ret != 0) {
         LOG_ERR("ATI request failed (%d)", ret);
         return ret;
     }
@@ -2632,8 +2734,147 @@ static int iqs9151_init(const struct device *dev) {
      * never disables user input. Do not retry calibration in a warning loop. */
     LOG_DBG("ATI complete");
 
-    // Setup IRQ Call Back
+    iqs9151_wait_for_ready(dev, 200);
+
+    ret = iqs9151_set_event_mode(dev);
+    if (ret != 0) {
+        LOG_ERR("Set Event Mode failed (%d)", ret);
+        return ret;
+    }
+    LOG_DBG("Set Event Mode complete");
+    return 0;
+}
+
+static int iqs9151_arm_frames(const struct device *dev) {
+    struct iqs9151_data *data = dev->data;
+    const struct iqs9151_config *cfg = dev->config;
+    int ret;
+
+    ret = iqs9151_set_interrupt(dev, true);
+    if (ret < 0) {
+        return ret;
+    }
+    atomic_set(&data->frames_enabled, 1);
+
+    /* Service immediately if RDY asserted before edge detection was enabled. */
+    ret = gpio_pin_get_dt(&cfg->irq_gpio);
+    if (ret < 0) {
+        atomic_clear(&data->frames_enabled);
+        (void)iqs9151_set_interrupt(dev, false);
+        return ret;
+    }
+    if (ret > 0) {
+        (void)iqs9151_work_submit(&data->work);
+    }
+    return 0;
+}
+
+static int iqs9151_bring_up(const struct device *dev, bool do_full_reset) {
+    const struct iqs9151_config *cfg = dev->config;
+    int ret = -EIO;
+
+    if (do_full_reset) {
+        iqs9151_pulse_hw_reset_and_recover_bus(dev);
+        for (int attempt = 0; attempt < IQS9151_BOOT_ID_RETRIES; attempt++) {
+            iqs9151_wait_for_ready(dev, 150);
+            ret = iqs9151_check_product_number(dev);
+            if (ret == 0) {
+                break;
+            }
+            LOG_WRN("Product number read failed (%d), try %d/%d",
+                    ret, attempt + 1, IQS9151_BOOT_ID_RETRIES);
+            (void)i2c_recover_bus(cfg->i2c.bus);
+            k_msleep(30);
+        }
+        if (ret != 0) {
+            return ret;
+        }
+
+        iqs9151_wait_for_ready(dev, 200);
+        ret = iqs9151_sw_reset(dev);
+        if (ret != 0) {
+            LOG_ERR("SW Reset failed (%d)", ret);
+            return ret;
+        }
+        LOG_DBG("SW Reset complete");
+    }
+
+    ret = iqs9151_configure_after_reset(dev);
+    if (ret != 0) {
+        return ret;
+    }
+
+    return iqs9151_arm_frames(dev);
+}
+
+static void iqs9151_schedule_recovery(struct iqs9151_data *data, int64_t now_ms,
+                                      bool hard_reset) {
+    if (hard_reset) {
+        data->recover_hard_reset = true;
+    }
+    if (data->last_recovery_ms != 0 &&
+        (now_ms - data->last_recovery_ms) > IQS9151_RECOVERY_WINDOW_MS) {
+        /* Restore retry budget when healthy in Event Mode with no touch frames. */
+        data->recovery_attempts = 0U;
+    }
+    data->last_recovery_ms = now_ms;
+
+    if (data->recovery_attempts >= IQS9151_TOTAL_RECOVERIES_MAX) {
+        LOG_ERR("IQS9151 recovery exhausted after %u attempts", data->recovery_attempts);
+        return;
+    }
+
+    k_timeout_t delay;
+    if (data->recovery_attempts == 0U && !hard_reset) {
+        delay = K_NO_WAIT;
+    } else if (data->recovery_attempts < IQS9151_FAST_RECOVERIES_MAX) {
+        delay = K_MSEC(IQS9151_FAST_RETRY_DELAY_MS);
+    } else {
+        delay = K_MSEC(IQS9151_SLOW_RETRY_DELAY_MS);
+    }
+
+    data->recovery_attempts++;
+    (void)iqs9151_work_reschedule(&data->recover_work, delay);
+}
+
+static void iqs9151_recover_work_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs9151_data *data = CONTAINER_OF(dwork, struct iqs9151_data, recover_work);
+    const struct device *dev = data->dev;
+    const bool hard_reset = data->recover_hard_reset;
+    int ret;
+
+    atomic_clear(&data->frames_enabled);
+    (void)k_work_cancel_delayable(&data->rdy_recheck_work);
+    ret = iqs9151_set_interrupt(dev, false);
+    if (ret < 0) {
+        LOG_ERR("Failed to disable IRQ for recovery (%d)", ret);
+        iqs9151_schedule_recovery(data, k_uptime_get(), true);
+        return;
+    }
+
+    ret = iqs9151_bring_up(dev, hard_reset);
+    if (ret == 0) {
+        LOG_INF("IQS9151 recovery complete (attempt %u)", data->recovery_attempts);
+        data->recover_hard_reset = false;
+        data->consecutive_read_errors = 0U;
+        return;
+    }
+
+    LOG_WRN("IQS9151 recovery attempt %u failed (%d)", data->recovery_attempts, ret);
+    iqs9151_schedule_recovery(data, k_uptime_get(), true);
+}
+
+static void iqs9151_init_runtime_state(struct iqs9151_data *data, const struct device *dev) {
+    data->dev = dev;
+    atomic_clear(&data->frames_enabled);
+    data->recover_hard_reset = false;
+    data->recovery_attempts = 0U;
+    data->consecutive_read_errors = 0U;
+    data->last_recovery_ms = 0;
     k_work_init(&data->work, iqs9151_work_cb);
+    k_work_init_delayable(&data->recover_work, iqs9151_recover_work_cb);
+    k_work_init_delayable(&data->rdy_recheck_work, iqs9151_rdy_recheck_work_cb);
     k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
     k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
@@ -2657,26 +2898,73 @@ static int iqs9151_init(const struct device *dev) {
     iqs9151_three_finger_reset(data);
     data->hold_button = 0U;
     iqs9151_reset_finger_history(data);
-    gpio_init_callback(&data->gpio_cb, iqs9151_gpio_cb,
-                        BIT(cfg->irq_gpio.pin));
+}
+
+static int __maybe_unused iqs9151_init(const struct device *dev) {
+    const struct iqs9151_config *cfg = dev->config;
+    struct iqs9151_data *data = dev->data;
+    int ret;
+
+#ifndef CONFIG_INPUT_IQS9151_TEST
+    if (atomic_cas(&iqs9151_wq_started, 0, 1)) {
+        k_work_queue_init(&iqs9151_wq);
+        k_work_queue_start(&iqs9151_wq, iqs9151_wq_stack,
+                           K_THREAD_STACK_SIZEOF(iqs9151_wq_stack),
+                           IQS9151_WQ_PRIORITY, NULL);
+        k_thread_name_set(&iqs9151_wq.thread, "iqs9151_wq");
+    }
+#endif
+
+    LOG_DBG("Initialization Start");
+
+    if (!device_is_ready(cfg->i2c.bus)) {
+        LOG_ERR("I2C bus not ready");
+        return -ENODEV;
+    }
+    if (!cfg->irq_gpio.port || !device_is_ready(cfg->irq_gpio.port)) {
+        LOG_ERR("IRQ GPIO not ready");
+        return -ENODEV;
+    }
+
+    ret = gpio_pin_configure_dt(&cfg->irq_gpio, GPIO_INPUT);
+    if (ret != 0) {
+        return ret;
+    }
+    (void)iqs9151_set_interrupt(dev, false);
+
+    if (cfg->reset_gpio.port != NULL) {
+        if (!device_is_ready(cfg->reset_gpio.port)) {
+            LOG_ERR("Reset GPIO not ready");
+            return -ENODEV;
+        }
+        ret = gpio_pin_configure_dt(&cfg->reset_gpio, GPIO_OUTPUT_INACTIVE);
+        if (ret != 0) {
+            LOG_ERR("Failed to configure reset GPIO (%d)", ret);
+            return ret;
+        }
+    }
+
+    iqs9151_init_runtime_state(data, dev);
+
+    gpio_init_callback(&data->gpio_cb, iqs9151_gpio_cb, BIT(cfg->irq_gpio.pin));
     ret = gpio_add_callback(cfg->irq_gpio.port, &data->gpio_cb);
     if (ret < 0) {
         LOG_ERR("Failed to set DR callback: %d", ret);
         return -EIO;
     }
 
-    iqs9151_wait_for_ready(dev, 100);
-
-    // Set Event Mode
-    ret = iqs9151_set_event_mode(dev);
-    if (ret) {
-        LOG_ERR("Set Event Mode failed (%d)", ret);
-        return ret;
+    ret = iqs9151_bring_up(dev, true);
+    if (ret != 0) {
+        /*
+         * Keep the Zephyr input device ready so ZMK's input-listener stays
+         * attached when cold-boot power or VBUS switchover settles late,
+         * and complete bring-up asynchronously on recover_work.
+         */
+        LOG_WRN("Initial setup deferred (%d); scheduling background bring-up", ret);
+        iqs9151_schedule_recovery(data, k_uptime_get(), true);
+        return 0;
     }
-    LOG_DBG("Set Event Mode complete complete");
 
-    // start IRQ
-    iqs9151_set_interrupt(dev, true);
     LOG_DBG("Initialization complete");
     return 0;
 }
@@ -2690,36 +2978,14 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     struct iqs9151_data *data = (struct iqs9151_data *)ctx;
 
     memset(data, 0, sizeof(*data));
-    data->dev = dev;
-    k_work_init(&data->work, iqs9151_work_cb);
-    k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
-    k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
-    k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
-    k_work_init_delayable(&data->inertia_scroll_work, iqs9151_inertia_scroll_work_cb);
-    k_work_init_delayable(&data->inertia_cursor_work, iqs9151_inertia_cursor_work_cb);
-    iqs9151_inertia_state_reset(&data->inertia_scroll);
-    iqs9151_inertia_state_reset(&data->inertia_cursor);
-    iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
-    iqs9151_ema_reset(&data->cursor_ema_x_fp, &data->cursor_ema_y_fp);
-    iqs9151_motion_history_reset(&data->scroll_motion_history);
-    iqs9151_motion_history_reset(&data->cursor_motion_history);
-    iqs9151_one_finger_reset(&data->one_finger);
-    iqs9151_two_finger_reset(&data->two_finger);
-    iqs9151_clear_one_finger_click_pending(data);
-    iqs9151_clear_two_finger_click_pending(data);
-    iqs9151_clear_three_finger_click_pending(data);
-    data->two_finger_one_lead_valid = false;
-    data->two_finger_tail_suppresses_cursor = false;
-    data->three_finger_one_lead_valid = false;
-    data->three_finger_two_lead_valid = false;
-    iqs9151_three_finger_reset(data);
-    data->hold_button = 0U;
-    iqs9151_reset_finger_history(data);
+    iqs9151_init_runtime_state(data, dev);
 }
 
 void iqs9151_test_cancel_pending_work(void *ctx) {
     struct iqs9151_data *data = (struct iqs9151_data *)ctx;
 
+    (void)k_work_cancel_delayable(&data->recover_work);
+    (void)k_work_cancel_delayable(&data->rdy_recheck_work);
     (void)k_work_cancel_delayable(&data->one_finger_click_work);
     (void)k_work_cancel_delayable(&data->two_finger_click_work);
     (void)k_work_cancel_delayable(&data->three_finger_click_work);
@@ -2791,11 +3057,12 @@ void iqs9151_test_force_pinch_session(void *ctx, bool active) {
 #endif
 
 #define IQS9151_INIT(inst)                                                \
-    static const struct iqs9151_config iqs9151_config_##inst = {    \
-        .i2c = I2C_DT_SPEC_INST_GET(inst),                                      \
-        .irq_gpio = GPIO_DT_SPEC_INST_GET(inst, irq_gpios),                     \
-  };                                                                          \
-  static struct iqs9151_data iqs9151_data_##inst;                 \
+    static const struct iqs9151_config iqs9151_config_##inst = {          \
+        .i2c = I2C_DT_SPEC_INST_GET(inst),                                \
+        .irq_gpio = GPIO_DT_SPEC_INST_GET(inst, irq_gpios),               \
+        .reset_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, reset_gpios, {0}),   \
+    };                                                                    \
+    static struct iqs9151_data iqs9151_data_##inst;                       \
   DEVICE_DT_INST_DEFINE(inst, iqs9151_init, NULL,                       \
                         &iqs9151_data_##inst,                           \
                         &iqs9151_config_##inst, POST_KERNEL,            \
